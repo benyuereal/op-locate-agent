@@ -12,28 +12,102 @@
 
 ## 快速验证（完整 vLLM + HF 启动例子）
 
-最快的方式——端到端跑 vLLM + HF 并对比输出：
+入门先看 [`examples/quickstart_antangelmed.py`](./examples/quickstart_antangelmed.py)——
+它是这个 repo 的"门面"脚本：探测平台 → 跑 HF(基准) → 跑 vLLM → 对比输出 token，
+一次给出"vLLM 和 HF 对不对齐"的结论。也是 clone 下来第一个该跑的脚本。
+
+### 一次精度对比测试怎么跑
 
 ```bash
 cd op_locate_agent
 
-# 4 卡（vLLM TP=4 + HF device_map 4 卡）
-HIP_VISIBLE_DEVICES=0,1,6,7 python3 examples/quickstart_antangelmed.py
-
-# 单卡（小模型）
-HIP_VISIBLE_DEVICES=2 python3 examples/quickstart_antangelmed.py
-
-# 只跑某一边
-HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/quickstart_antangelmed.py --skip-vllm
-HIP_VISIBLE_DEVICES=2 python3 examples/quickstart_antangelmed.py --skip-hf
+HIP_VISIBLE_DEVICES=<空闲卡> python3 examples/quickstart_antangelmed.py \
+    --model <模型路径> \
+    --prompt "你好，请介绍一下你自己" \
+    --max-tokens 32
 ```
 
-预期（AntAngelMed on gfx936）：HF 输出正常中文，vLLM 带 `VLLM_ENABLE_MOE_FUSED_GATE=0` 也输出正常中文，两者一致 → ✅。
+**参数说明**
 
-单独跑启动脚本：
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `HIP_VISIBLE_DEVICES` | 必填（前置） | 用哪些卡，**用户自己指定**，脚本不自动选 |
+| `--model` | `/models/AntAngelMed` | 模型本地目录（含 config.json） |
+| `--tp` | =可见卡数 | vLLM tensor parallel，默认等于暴露的卡数 |
+| `--prompt` | 内置 | 对比用的提示词 |
+| `--max-tokens` | 32 | 生成 token 数 |
+| `--skip-hf` / `--skip-vllm` | off | 只跑一边 |
+| `--no-fix-env` | off | 不设 `VLLM_ENABLE_MOE_FUSED_GATE=0`（默认会设） |
+
+**几种典型用法**
+
 ```bash
-HIP_VISIBLE_DEVICES=0,1,6,7 TP=4 ./run/run_vllm.sh /models/AntAngelMed
-HIP_VISIBLE_DEVICES=2,3,4,5 ./run/run_hf.sh /models/AntAngelMed
+# 默认模型、4 卡：vLLM TP=4 + HF device_map 铺 4 卡
+HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/quickstart_antangelmed.py
+
+# 指定别的模型（大 MoE 同样需要多卡）
+HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/quickstart_antangelmed.py --model /path/to/other_moe
+
+# 只跑 vLLM 一边（先确认 vLLM 自己能出正常输出）
+HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/quickstart_antangelmed.py --skip-hf
+
+# 非 gfx936-MoE 模型 / 不想加修复开关时
+HIP_VISIBLE_DEVICES=2 python3 examples/quickstart_antangelmed.py --model /path/to/small_model --no-fix-env
+```
+
+**选卡注意**
+
+- 大模型（如 AntAngelMed ~192GB）**HF 单卡装不下**，靠 `device_map="auto"` 铺多卡，
+  所以 `HIP_VISIBLE_DEVICES` 要暴露**≥4 张空闲卡**（每张 ~64GB）。
+- vLLM 用 TP，`--tp` 必须 ≤ 暴露卡数（默认相等）。
+- 先用 `rocminfo` / `rocm-smi` 确认指定的卡**确实空闲**，别占用在线服务的卡。
+- `HIP_VISIBLE_DEVICES=0,1,6,7` 这种写法只是示例，**实际请填本机空闲卡号**。
+
+**跑起来会看到什么（日志阶段）**
+
+脚本分阶段实时打印进度（不会卡几分钟没反应）：
+
+```
+[platform] Hygon DCU BW100 (gfx936), HIP 6.3.26113, 4 devices, is_cuda=False is_rocm=True
+[platform] HIP_VISIBLE_DEVICES=2,3,4,5 (4 卡)
+============================================================
+[HF] 加载 transformers ...
+============================================================
+  [HF] 1/4 加载 config...
+  [HF] config patch: ['add_router_probs', ...]
+  [HF] 2/4 加载模型权重 (device_map=auto, bf16, eager)...     ← 大模型这里最慢
+  [HF] 3/4 加载 tokenizer...
+  [HF] 4/4 generate...
+  [HF] token_ids: [198, 198, 7018, ...]
+============================================================
+[vLLM] 加载 vLLM (tp=4, VLLM_ENABLE_MOE_FUSED_GATE=0)...
+============================================================
+  [vLLM] 1/3 构造 LLM (tp=4, bf16, eager, gmu=0.9)...        ← 这里最慢：加载权重+编译图+KV cache
+  [vLLM] 2/3 generate...
+  [vLLM] token_ids: [...]
+============================================================
+[compare] HF vs vLLM
+============================================================
+[compare] token 前缀一致率: 95.8% (23/24)
+[compare] vLLM 含 NULL(188): False
+[compare] HF text:    '...'
+[compare] vLLM text:  '...'
+
+[verdict] ✅ vLLM 与 HF 基本一致 — 精度正常
+```
+
+**verdict 判定**
+
+- ✅ 一致率 ≥ 90% 且无 NULL → 精度正常
+- ❌ vLLM 输出全 NULL(188) → 精度问题未修复，接着用 agent 定位
+- ⚠️ 一致率 < 90% 且非全 NULL → 部分对齐，需进一步定位（用 op-locate skill）
+
+### 单独跑启动脚本（调试用）
+
+不想端到端、只想单独看一边的启动行为：
+```bash
+HIP_VISIBLE_DEVICES=2,3,4,5 TP=4 ./run/run_vllm.sh /models/AntAngelMed "你好"
+HIP_VISIBLE_DEVICES=2,3,4,5 ./run/run_hf.sh /models/AntAngelMed "你好"
 ```
 
 ## 使用 agent 定位

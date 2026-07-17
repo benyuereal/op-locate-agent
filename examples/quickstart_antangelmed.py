@@ -97,18 +97,22 @@ model_path = %r
 prompt = %r
 max_tokens = %r
 
+print("[HF] 1/4 加载 config...", flush=True)
 cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
 patched = config_patch.patch_config(cfg)
 if patched:
     print(f"[HF] config patch: {patched}", flush=True)
 
+print("[HF] 2/4 加载模型权重 (device_map=auto, bf16, eager)...", flush=True)
 model = AutoModelForCausalLM.from_pretrained(
     model_path, config=cfg, torch_dtype=torch.bfloat16,
     trust_remote_code=True, local_files_only=True,
     attn_implementation="eager", device_map="auto",
 ).eval()
+print("[HF] 3/4 加载 tokenizer...", flush=True)
 tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
 
+print("[HF] 4/4 generate...", flush=True)
 first_dev = next(model.parameters()).device
 ids = tok(prompt, return_tensors="pt").input_ids.to(first_dev)
 with torch.no_grad():
@@ -126,11 +130,14 @@ prompt = %r
 max_tokens = %r
 tp = %r
 
+print("[vLLM] 1/3 构造 LLM (tp=%d, bf16, eager, gmu=0.9)..." % tp, flush=True)
+print("[vLLM]    若卡在此处较久：正在加载权重 + 编译图 + 初始化 KV cache", flush=True)
 llm = LLM(
     model=model_path, tensor_parallel_size=tp, dtype="bfloat16",
     trust_remote_code=True, enforce_eager=True,
     max_model_len=2048, gpu_memory_utilization=0.9,
 )
+print("[vLLM] 2/3 generate...", flush=True)
 sp = SamplingParams(temperature=0.0, max_tokens=max_tokens)
 outs = llm.generate([prompt], sp)
 new_ids = list(outs[0].outputs[0].token_ids)
@@ -139,28 +146,31 @@ print("RESULT_JSON:", json.dumps({"token_ids": new_ids, "text": text}), flush=Tr
 """
 
 
-def run_subprocess(script: str, extra_env: dict = None) -> dict:
-    """起子进程跑 script，继承父环境（含 HIP_VISIBLE_DEVICES），解析 RESULT_JSON"""
+def run_subprocess(script: str, extra_env: dict = None, tag: str = "sub") -> dict:
+    """起子进程跑 script，继承父环境（含 HIP_VISIBLE_DEVICES），实时透传进度。
+
+    用 Popen + 行级读取，子进程每打一行父进程立刻回显，避免 vLLM 加载几分钟
+    看起来像卡死。RESULT_JSON 行被解析后不打印。
+    """
     env = dict(os.environ)
     if extra_env:
         env.update(extra_env)
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env, capture_output=True, text=True,
+    env["PYTHONUNBUFFERED"] = "1"   # 子进程不缓冲，进度实时出来
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", script],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
-    if proc.stderr:
-        for line in proc.stderr.splitlines():
-            if any(k in line.lower() for k in ("error", "traceback", "oom", "exception")):
-                print(f"  [sub stderr] {line}")
     result = None
-    for line in proc.stdout.splitlines():
+    assert proc.stdout is not None
+    for line in proc.stdout:        # 行级迭代，实时
+        line = line.rstrip("\n")
         if line.startswith("RESULT_JSON:"):
             result = json.loads(line[len("RESULT_JSON:"):].strip())
-        else:
-            print(f"  [sub] {line}")
+            continue
+        if line.strip():
+            print(f"  [{tag}] {line}")
+    proc.wait()
     if proc.returncode != 0 and result is None:
-        print(proc.stdout[-2000:])
-        print(proc.stderr[-2000:])
         raise RuntimeError(f"子进程失败 returncode={proc.returncode}")
     return result
 
@@ -171,7 +181,7 @@ def run_hf(args):
           f"{os.environ.get('HIP_VISIBLE_DEVICES','?')})...")
     print("=" * 60)
     script = _HF_SCRIPT % (_ROOT, args.model, args.prompt, args.max_tokens)
-    return run_subprocess(script)
+    return run_subprocess(script, tag="HF")
 
 
 def run_vllm(args, tp):
@@ -183,7 +193,7 @@ def run_vllm(args, tp):
     if not args.no_fix_env:
         extra["VLLM_ENABLE_MOE_FUSED_GATE"] = "0"
     script = _VLLM_SCRIPT % (args.model, args.prompt, args.max_tokens, tp)
-    return run_subprocess(script, extra_env=extra)
+    return run_subprocess(script, extra_env=extra, tag="vLLM")
 
 
 def compare(hf: dict, vllm: dict):
