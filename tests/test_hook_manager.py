@@ -83,6 +83,37 @@ class TestHookManager:
         assert "layer0_patched" in inter
         assert inter["layer0_patched"].shape == (1, 4)
 
+    def test_patch_hook_output_index_tuple(self):
+        """patch 抓 forward 返回 tuple 的指定元素（MoE gate 返回 (idx,weight,logits) 用例）"""
+        class GateBlock(nn.Module):
+            """模拟 MoE gate：返回 (topk_idx, topk_weight, logits)"""
+            def __init__(self):
+                super().__init__()
+                self.lin = nn.Linear(4, 8, bias=False)
+            def forward(self, x):
+                logits = self.lin(x)
+                return torch.zeros(1, 2, dtype=torch.long), torch.ones(1, 2), logits
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate = GateBlock()
+            def forward(self, x):
+                return self.gate(x)
+        model = M()
+        hm = HookManager()
+        spec = CaptureSpec(hook_points=[
+            # output_index=-1 取 tuple 最后一个（logits），正如 router hook
+            HookPoint("logits", "gate", kind="patch", output_index=-1),
+            HookPoint("idx", "gate", kind="patch", output_index=0),
+        ], owner=model)
+        x = torch.ones(1, 4)
+        with hm.capture(model, spec):
+            model(x)
+        inter = hm.get_intermediates()
+        # logits 是 lin 输出 shape (1,8)，idx 是 zeros (1,2)
+        assert inter["logits"].shape == (1, 8)
+        assert inter["idx"].shape == (1, 2)
+
     def test_owner_storage(self):
         """捕获结果必须同时挂到 owner（防 collective_rpc 模块级 dict 不持久化）"""
         model = TinyModel()

@@ -134,7 +134,7 @@ prompt = %r
 max_tokens = %r
 tp = %r
 
-print("[vLLM] 1/3 构造 LLM (tp=%d, bf16, eager, gmu=0.9)..." % tp, flush=True)
+print("[vLLM] 1/3 构造 LLM (tp={}, bf16, eager, gmu=0.9)...".format(tp), flush=True)
 print("[vLLM]    若卡在此处较久：正在加载权重 + 编译图 + 初始化 KV cache", flush=True)
 llm = LLM(
     model=model_path, tensor_parallel_size=tp, dtype="bfloat16",
