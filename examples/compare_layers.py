@@ -73,6 +73,9 @@ def parse_args():
                     help="显式设 VLLM_ENABLE_MOE_FUSED_GATE=0 做对照（默认不设）")
     ap.add_argument("--skip-hf", action="store_true")
     ap.add_argument("--skip-vllm", action="store_true")
+    ap.add_argument("--layer-prefix", default="model.layers",
+                    help="decoder 层在模型里的点路径，默认 model.layers；"
+                         "GPT 系可能是 transformer.h，falcon 可能是 transformer.h")
     ap.add_argument("--atol", type=float, default=1e-2)
     ap.add_argument("--cos-thresh", type=float, default=0.999)
     return ap.parse_args()
@@ -95,8 +98,69 @@ def probe():
 # 子进程脚本：抓中间值落盘
 # ============================================================================
 
+# 探测层属性名的 helper，注入到两个子进程脚本（不同架构 attn/mlp/router 命名不同，
+# 硬编码 self_attn/mlp 在 BailingMoeV2 等模型上会失败）
+_DETECT_HELPER = r'''
+_ATTN_ALIASES = ["self_attn", "attention", "attn", "self_attention"]
+_MLP_ALIASES = ["mlp", "feed_forward", "ffn"]
+_ROUTER_ALIASES = ["router", "gate", "gate_up", "router_layer"]
+
+def _has_attr(mod, path):
+    obj = mod
+    for p in path.split("."):
+        if p.isdigit():
+            obj = obj[int(p)]
+        elif hasattr(obj, p):
+            obj = getattr(obj, p)
+        else:
+            return False
+    return True
+
+def _detect_attr(layer, aliases):
+    for a in aliases:
+        if hasattr(layer, a):
+            return a
+    return None
+
+def _detect_layer_attrs(model, layer_prefix="model.layers"):
+    """探测真实层的 attn/mlp/router 属性名。返回 (attn_attr, mlp_attr, router_relpath)。
+    router_relpath 相对 layer，如 'mlp.gate'；找不到返回 None。
+    attn/mlp 用第一层即可；router 要找第一个含 MoE 结构的层（前若干层可能是 dense，
+    没有 gate/experts）。"""
+    parts = layer_prefix.split(".")
+    obj = model
+    for p in parts:
+        obj = getattr(obj, p) if not p.isdigit() else obj[int(p)]
+    layers = obj
+    layer0 = layers[0]
+    attn = _detect_attr(layer0, _ATTN_ALIASES)
+    mlp = _detect_attr(layer0, _MLP_ALIASES)
+    router = None
+    if mlp:
+        for layer in layers:
+            mlp_mod = getattr(layer, mlp)
+            # router 在 mlp 下
+            for a in _ROUTER_ALIASES:
+                if hasattr(mlp_mod, a):
+                    router = f"{mlp}.{a}"; break
+            if router: break
+            # mlp.experts.router 嵌套
+            if hasattr(mlp_mod, "experts"):
+                exp = getattr(mlp_mod, "experts")
+                for a in _ROUTER_ALIASES:
+                    if hasattr(exp, a):
+                        router = f"{mlp}.experts.{a}"; break
+                if router: break
+            # router 直接在 layer 下
+            for a in _ROUTER_ALIASES:
+                if hasattr(layer, a):
+                    router = a; break
+            if router: break
+    return attn, mlp, router
+'''
+
 # HF 侧：直接在主进程内挂 hook，跑 forward，落盘
-_HF_SCRIPT = r'''
+_HF_SCRIPT = _DETECT_HELPER + r'''
 import os, sys, json, torch
 sys.path.insert(0, %r)
 from lib import load_model_profile, HookManager, HookPoint, CaptureSpec, config_patch
@@ -108,6 +172,7 @@ max_tokens = %r
 out_pt = %r
 layers_arg = %r   # None 或 list[int]
 only_arg = %r     # None 或 "attn"/"mlp"/"router"
+layer_prefix = %r
 
 prof = load_model_profile(model_path)
 cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
@@ -121,17 +186,25 @@ model = AutoModelForCausalLM.from_pretrained(
 ).eval()
 tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
 
+# 探测真实层属性名（不硬编码 self_attn/mlp）
+attn_attr, mlp_attr, router_rel = _detect_layer_attrs(model, layer_prefix)
+print(f"[HF] 探测到 attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
+if only_arg == "attn" and not attn_attr:
+    print("[HF] 警告：未探测到 attn 属性，无法挂 attn hook", flush=True)
+if only_arg == "mlp" and not mlp_attr:
+    print("[HF] 警告：未探测到 mlp 属性，无法挂 mlp hook", flush=True)
+
 # 建 hook 点
 layers = layers_arg if layers_arg is not None else list(range(prof.num_layers))
 pts = []
 for i in layers:
-    base = f"model.layers.{i}"
-    if only_arg in (None, "attn"):
-        pts.append(HookPoint(f"layer{i}_attn_out", f"{base}.self_attn", kind="post"))
-    if only_arg in (None, "mlp"):
-        pts.append(HookPoint(f"layer{i}_mlp_out", f"{base}.mlp", kind="post"))
-    if only_arg == "router" and prof.is_moe:
-        rp = f"{base}.mlp.experts.router"
+    base = f"{layer_prefix}.{i}"
+    if only_arg in (None, "attn") and attn_attr:
+        pts.append(HookPoint(f"layer{i}_attn_out", f"{base}.{attn_attr}", kind="post"))
+    if only_arg in (None, "mlp") and mlp_attr:
+        pts.append(HookPoint(f"layer{i}_mlp_out", f"{base}.{mlp_attr}", kind="post"))
+    if only_arg == "router" and prof.is_moe and router_rel:
+        rp = f"{base}.{router_rel}"
         pts.append(HookPoint(f"layer{i}_router_logits", rp, kind="pre"))
         pts.append(HookPoint(f"layer{i}_topk", rp, kind="post"))
 print(f"[HF] hook 点数: {len(pts)}", flush=True)
@@ -151,7 +224,7 @@ print(f"[HF] gen_ids: {out[0][ids.shape[1]:].tolist()}", flush=True)
 '''
 
 # vLLM 侧：单进程 worker 模式挂 hook
-_VLLM_SCRIPT = r'''
+_VLLM_SCRIPT = _DETECT_HELPER + r'''
 import os, sys, torch
 os.environ.setdefault("VLLM_PLATFORM_WORKER_MULTIPROC", "0")  # 单进程，hook 才能挂上
 sys.path.insert(0, %r)
@@ -165,6 +238,7 @@ tp = %r
 out_pt = %r
 layers_arg = %r
 only_arg = %r
+layer_prefix = %r
 
 prof = load_model_profile(model_path)
 print(f"[vLLM] layers={prof.num_layers} moe={prof.is_moe}", flush=True)
@@ -179,16 +253,20 @@ llm = LLM(
 worker_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
 print(f"[vLLM] worker_model type: {type(worker_model).__name__}", flush=True)
 
+# 探测真实层属性名
+attn_attr, mlp_attr, router_rel = _detect_layer_attrs(worker_model, layer_prefix)
+print(f"[vLLM] 探测到 attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
+
 layers = layers_arg if layers_arg is not None else list(range(prof.num_layers))
 pts = []
 for i in layers:
-    base = f"model.layers.{i}"
-    if only_arg in (None, "attn"):
-        pts.append(HookPoint(f"layer{i}_attn_out", f"{base}.self_attn", kind="post"))
-    if only_arg in (None, "mlp"):
-        pts.append(HookPoint(f"layer{i}_mlp_out", f"{base}.mlp", kind="post"))
-    if only_arg == "router" and prof.is_moe:
-        rp = f"{base}.mlp.experts.router"
+    base = f"{layer_prefix}.{i}"
+    if only_arg in (None, "attn") and attn_attr:
+        pts.append(HookPoint(f"layer{i}_attn_out", f"{base}.{attn_attr}", kind="post"))
+    if only_arg in (None, "mlp") and mlp_attr:
+        pts.append(HookPoint(f"layer{i}_mlp_out", f"{base}.{mlp_attr}", kind="post"))
+    if only_arg == "router" and prof.is_moe and router_rel:
+        rp = f"{base}.{router_rel}"
         pts.append(HookPoint(f"layer{i}_router_logits", rp, kind="pre"))
         pts.append(HookPoint(f"layer{i}_topk", rp, kind="post"))
 print(f"[vLLM] hook 点数: {len(pts)}", flush=True)
@@ -246,7 +324,7 @@ def main():
         print("[HF] 抓逐层中间值...")
         print("=" * 60)
         script = _HF_SCRIPT % (_ROOT, args.model, args.prompt, args.max_tokens,
-                               hf_pt, layers_arg, args.only)
+                               hf_pt, layers_arg, args.only, args.layer_prefix)
         run_subprocess(script, tag="HF")
 
     if not args.skip_vllm:
@@ -256,7 +334,7 @@ def main():
         print("=" * 60)
         extra = {"VLLM_ENABLE_MOE_FUSED_GATE": "0"} if args.fix_env else {}
         script = _VLLM_SCRIPT % (_ROOT, args.model, args.prompt, args.max_tokens,
-                                 tp, vllm_pt, layers_arg, args.only)
+                                 tp, vllm_pt, layers_arg, args.only, args.layer_prefix)
         run_subprocess(script, extra_env=extra, tag="vLLM")
 
     if args.skip_hf or args.skip_vllm:
