@@ -15,6 +15,7 @@ from .tensor_compare import (
     compare_tensors,
 )
 from .platform_probe import PlatformInfo, probe_platform, recommended_idle_gpu
+from .model_probe import ModelProbeResult, probe_model, save_probe_result
 from . import config_patch
 
 __all__ = [
@@ -33,5 +34,8 @@ __all__ = [
     "PlatformInfo",
     "probe_platform",
     "recommended_idle_gpu",
+    "ModelProbeResult",
+    "probe_model",
+    "save_probe_result",
     "config_patch",
 ]

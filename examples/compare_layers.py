@@ -76,6 +76,10 @@ def parse_args():
     ap.add_argument("--layer-prefix", default="model.layers",
                     help="decoder 层在模型里的点路径，默认 model.layers；"
                          "GPT 系可能是 transformer.h，falcon 可能是 transformer.h")
+    ap.add_argument("--probe-dir", default=None,
+                    help="读取 probe_model.py 落盘的探测结果（model_probe.json），"
+                         "用其中的 layer_prefix/attn/mlp/router，跳过运行时探测。"
+                         "推荐：先跑 probe_model.py 再用此参数")
     ap.add_argument("--atol", type=float, default=1e-2)
     ap.add_argument("--cos-thresh", type=float, default=0.999)
     return ap.parse_args()
@@ -173,6 +177,7 @@ out_pt = %r
 layers_arg = %r   # None 或 list[int]
 only_arg = %r     # None 或 "attn"/"mlp"/"router"
 layer_prefix = %r
+probe_attrs = %r  # None 或 dict(layer_prefix/attn/mlp/router)，来自 probe_model.py
 
 prof = load_model_profile(model_path)
 cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
@@ -186,9 +191,13 @@ model = AutoModelForCausalLM.from_pretrained(
 ).eval()
 tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
 
-# 探测真实层属性名（不硬编码 self_attn/mlp）
-attn_attr, mlp_attr, router_rel = _detect_layer_attrs(model, layer_prefix)
-print(f"[HF] 探测到 attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
+# 属性名：优先用 probe_attrs（probe_model.py 落盘的探测结果），否则运行时反射探测
+if probe_attrs and probe_attrs.get("attn"):
+    attn_attr = probe_attrs["attn"]; mlp_attr = probe_attrs["mlp"]; router_rel = probe_attrs["router"]
+    print(f"[HF] 用 probe 结果: attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
+else:
+    attn_attr, mlp_attr, router_rel = _detect_layer_attrs(model, layer_prefix)
+    print(f"[HF] 运行时探测: attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
 if only_arg == "attn" and not attn_attr:
     print("[HF] 警告：未探测到 attn 属性，无法挂 attn hook", flush=True)
 if only_arg == "mlp" and not mlp_attr:
@@ -239,6 +248,7 @@ out_pt = %r
 layers_arg = %r
 only_arg = %r
 layer_prefix = %r
+probe_attrs = %r  # None 或 dict，来自 probe_model.py
 
 prof = load_model_profile(model_path)
 print(f"[vLLM] layers={prof.num_layers} moe={prof.is_moe}", flush=True)
@@ -253,9 +263,13 @@ llm = LLM(
 worker_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
 print(f"[vLLM] worker_model type: {type(worker_model).__name__}", flush=True)
 
-# 探测真实层属性名
-attn_attr, mlp_attr, router_rel = _detect_layer_attrs(worker_model, layer_prefix)
-print(f"[vLLM] 探测到 attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
+# 属性名：优先用 probe_attrs，否则运行时反射探测
+if probe_attrs and probe_attrs.get("attn"):
+    attn_attr = probe_attrs["attn"]; mlp_attr = probe_attrs["mlp"]; router_rel = probe_attrs["router"]
+    print(f"[vLLM] 用 probe 结果: attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
+else:
+    attn_attr, mlp_attr, router_rel = _detect_layer_attrs(worker_model, layer_prefix)
+    print(f"[vLLM] 运行时探测: attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
 
 layers = layers_arg if layers_arg is not None else list(range(prof.num_layers))
 pts = []
@@ -315,6 +329,30 @@ def main():
     if args.layers:
         layers_arg = [int(x) for x in args.layers.split(",")]
 
+    # 读取 probe_model.py 落盘的探测结果（若提供）
+    probe_attrs = None
+    if args.probe_dir:
+        import json
+        pj = os.path.join(args.probe_dir, "model_probe.json")
+        if not os.path.isfile(pj):
+            print(f"错误：--probe-dir 下无 model_probe.json: {pj}", file=sys.stderr)
+            sys.exit(2)
+        with open(pj) as f:
+            pd = json.load(f)
+        probe_attrs = {
+            "layer_prefix": pd["layer_prefix"]["value"],
+            "attn": pd["attn_attr"]["value"],
+            "mlp": pd["mlp_attr"]["value"],
+            "router": pd["router_attr"]["value"],
+        }
+        # probe 的 layer_prefix 优先于 --layer-prefix
+        if probe_attrs["layer_prefix"]:
+            args.layer_prefix = probe_attrs["layer_prefix"]
+        print(f"[probe] 读取探测结果 {pj}")
+        print(f"[probe] layer_prefix={probe_attrs['layer_prefix']} "
+              f"attn={probe_attrs['attn']} mlp={probe_attrs['mlp']} "
+              f"router={probe_attrs['router']}")
+
     tmpdir = tempfile.mkdtemp(prefix="compare_layers_")
     hf_pt = os.path.join(tmpdir, "hf_inter.pt")
     vllm_pt = os.path.join(tmpdir, "vllm_inter.pt")
@@ -324,7 +362,7 @@ def main():
         print("[HF] 抓逐层中间值...")
         print("=" * 60)
         script = _HF_SCRIPT % (_ROOT, args.model, args.prompt, args.max_tokens,
-                               hf_pt, layers_arg, args.only, args.layer_prefix)
+                               hf_pt, layers_arg, args.only, args.layer_prefix, probe_attrs)
         run_subprocess(script, tag="HF")
 
     if not args.skip_vllm:
@@ -334,7 +372,7 @@ def main():
         print("=" * 60)
         extra = {"VLLM_ENABLE_MOE_FUSED_GATE": "0"} if args.fix_env else {}
         script = _VLLM_SCRIPT % (_ROOT, args.model, args.prompt, args.max_tokens,
-                                 tp, vllm_pt, layers_arg, args.only, args.layer_prefix)
+                                 tp, vllm_pt, layers_arg, args.only, args.layer_prefix, probe_attrs)
         run_subprocess(script, extra_env=extra, tag="vLLM")
 
     if args.skip_hf or args.skip_vllm:
