@@ -1,45 +1,55 @@
 """
-compare_layers.py — 逐层 / 逐算子中间值对比（HF 基准 vs vLLM）
+compare_layers.py — 逐层中间值对比（HF 基准 vs vLLM），定位精度发散点
 
-quickstart 只比最终 token；本脚本比**每一层、每个关键算子的中间张量**，
-把"哪一层开始发散、哪个算子开始发散"打印出来，定位精度问题到具体层/算子。
+比 quickstart（只比最终 token）更进一步：hook 每层入口的 hidden_states（残差，
+层间流动的真值），逐层对比 cos/max_diff，看误差从哪层开始、如何累积放大。
 
-== 原理 ==
-1. 用 lib.hook_manager 的 HookManager 在 HF 模型和 vLLM worker 模型上挂同一组
-   hook 点（逐层：attn_out / mlp_out；MoE：router_logits）。
-2. HF、vLLM 各起独立子进程跑同一个 prompt，hook 抓到的中间张量序列化落盘
-   （.pt 文件，仅本次运行用）。
-3. 主进程读两边的 .pt，逐 hook 点用 lib.tensor_compare 对比，打印每层每算子
-   的 cos / max_abs / 是否发散，并标出第一个发散点。
+== 口径（关键，源自历史验证过的 test_stage_compare.py）==
+1. **比 layer INPUT hidden_states**，不是 attn_out/mlp_out。原因：vLLM
+   BailingMoeBlock.forward 返回 (hidden_states, residual) 分开，"层输出"对下一层
+   就是它的 input；hook 每层 input 给出一致跨层口径，且就是层间真实流动值。
+2. **用 register_forward_PRE_hook + 立即 clone**，不用 post-hook。原因：layer
+   body 做 `residual = hidden_states` 后有 in-place 操作，会改 args[0]，post-hook
+   抓到的是被污染的脏值（历史曾因此误判 layer0 发散，实际是 hook 口径 bug）。
+3. **embedding 用 monkey-patch embed_input_ids**，不用 register_forward_hook。
+   原因：VocabParallelEmbedding 是 CustomOp，register_forward_hook 对 CustomOp
+   不可靠（抓的不是真正用于 forward 的输出）。
+4. **采样层覆盖全模型** [0,1,2,8,16,24,31]（浅+中+深），不只前几层——误差常在
+   深层累积放大。`--layers` 可覆盖。
+5. **prefill + decode1 两阶段**，用 call counter 切换——发散可能在 decode 才暴露。
+
+== 子算子细化（可选）==
+默认比 layer input（残差）。定位到发散层后，用 `--only attn/mlp/router` 在该层
+内做算子级对比（attn_out/mlp_out/router_logits）。注意子模块输出用 post-hook，
+口径不如 layer input 可靠，仅作 drill-down 参考。
 
 == 卡的指定 ==
 卡由用户用 HIP_VISIBLE_DEVICES 前置指定，脚本继承不覆盖：
     HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py --model /path/to/model
 
 == 用法 ==
-    # 逐层对比所有层（大模型省显存可 --layers 0,1,15,30）
+    # 默认：全模型采样层 [0,1,2,8,16,24,31] 的 layer input 对比
     HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py --model /path/to/model
 
-    # 只比前 4 层 + 中间几层（省显存/省时间）
-    HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py --model /path/to/model --layers 0,1,2,3,15,30
+    # 指定层（省时间/聚焦）
+    HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py --model /path/to/model --layers 0,1,2,27,30,31
 
-    # 只比 router（MoE 选专家那一步），不比 attn/mlp
-    HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py --model /path/to/model --only router
+    # 发散层内算子级细化（定位是 attn 还是 mlp 发散）
+    HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py --model /path/to/model --layers 27 --only mlp
 
-    # 对照验证：让 vLLM 绕过 fused_gate
+    # 对照验证：让 vLLM 绕过 fused_gate（历史已排除 fused_gate，仅备对照）
     HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py --model /path/to/model --env
 
 == 前置 ==
-    - vLLM + transformers + torch 已装
-    - 模型已下载到本地
-    - 用户已确认指定卡空闲
+    - 先跑 probe_model.py 探测架构（attn/mlp/router 属性名），用 --probe-dir 传入
+    - vLLM + transformers + torch 已装，模型已下载，指定卡空闲
 
 == 说明 ==
     - 排查工具不预设结论：默认不设任何修复环境变量，需对照用 --env
-    - vLLM 侧 TP>1 时 worker 在 spawn 子进程，主进程拿不到 model 对象，
-      故用 collective_rpc 把 hook 函数 RPC 进 worker 子进程注册（需
-      VLLM_ALLOW_INSECURE_SERIALIZATION=1）。捕获结果存 worker 内 model._cap
-      （持久对象），不能存模块级 dict——collective_rpc 每次序列化新副本会读不到。
+    - vLLM 侧 TP>1 时 worker 在 spawn 子进程，主进程拿不到 model 对象，用
+      collective_rpc 把 hook 函数 RPC 进 worker 子进程注册（需
+      VLLM_ALLOW_INSECURE_SERIALIZATION=1）。捕获存 worker 内 model._cap（持久
+      对象），不能存模块级 dict——collective_rpc 每次序列化新副本会读不到。
 """
 
 from __future__ import annotations
@@ -57,32 +67,32 @@ sys.path.insert(0, _ROOT)
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="逐层 / 逐算子中间值对比 (HF vs vLLM)",
+        description="逐层中间值对比 (HF vs vLLM)，定位精度发散点",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--model", required=True,
                     help="模型本地路径（必填，含 config.json）")
     ap.add_argument("--tp", type=int, default=None, help="vLLM TP，默认=可见卡数")
-    ap.add_argument("--prompt", default="你好，请介绍一下你自己")
+    ap.add_argument("--prompt", default="你好，我是一名医生")
     ap.add_argument("--max-tokens", type=int, default=1,
-                    help="生成 token 数，逐层对比默认只看首 token（1）即可定位发散层")
+                    help="vLLM 生成 token 数；默认 1（prefill+1 decode）。"
+                         "逐层定位看 prefill 即可，decode1 由阶段切换自动捕获")
     ap.add_argument("--layers", default=None,
-                    help="只比这些层，逗号分隔，如 0,1,2,15,30；默认全部层")
+                    help="采样层，逗号分隔；默认自动选 [0,1,2,8,16,24,31] 按总层数缩放")
     ap.add_argument("--only", default=None,
                     choices=["attn", "mlp", "router"],
-                    help="只比某一类算子；默认全部（attn+mlp+router）")
+                    help="只比某一类子算子（attn_out/mlp_out/router_logits），"
+                         "用于发散层内 drill-down；默认比 layer input 残差")
     ap.add_argument("--env", action="store_true",
                     help="显式设 VLLM_ENABLE_MOE_FUSED_GATE=0 做对照（绕过 fused_gate，"
                          "默认不设——排查工具不预设结论）")
     ap.add_argument("--skip-hf", action="store_true")
     ap.add_argument("--skip-vllm", action="store_true")
     ap.add_argument("--layer-prefix", default="model.layers",
-                    help="decoder 层在模型里的点路径，默认 model.layers；"
-                         "GPT 系可能是 transformer.h，falcon 可能是 transformer.h")
+                    help="decoder 层在模型里的点路径，默认 model.layers")
     ap.add_argument("--probe-dir", default=None,
-                    help="读取 probe_model.py 落盘的探测结果（model_probe.json），"
-                         "用其中的 layer_prefix/attn/mlp/router，跳过运行时探测。"
-                         "推荐：先跑 probe_model.py 再用此参数")
+                    help="读取 probe_model.py 落盘的 model_probe.json，用其中的 "
+                         "layer_prefix/attn/mlp/router。推荐先跑 probe_model.py")
     ap.add_argument("--atol", type=float, default=1e-2)
     ap.add_argument("--cos-thresh", type=float, default=0.999)
     return ap.parse_args()
@@ -91,6 +101,18 @@ def parse_args():
 def n_visible_gpus() -> int:
     v = os.environ.get("HIP_VISIBLE_DEVICES", "")
     return len([x for x in v.split(",") if x.strip() != ""]) if v else 0
+
+
+def sample_layers(num_layers: int) -> list[int]:
+    """全模型采样层：浅+中+深，按总层数缩放。32 层 → [0,1,2,8,16,24,31]。"""
+    if num_layers <= 8:
+        return list(range(num_layers))
+    n = num_layers
+    return sorted(set([
+        0, 1, 2,
+        n // 4, n // 2, (3 * n) // 4,
+        n - 4, n - 2, n - 1,
+    ]))
 
 
 def probe():
@@ -105,18 +127,14 @@ def probe():
 # 子进程脚本：抓中间值落盘
 # ============================================================================
 
-# 探测层属性名的 helper，注入到两个子进程脚本。直接复用 lib.model_probe 的别名表
-# 与探测函数，避免重复定义导致两处发散（不同架构 attn/mlp/router 命名不同）。
+# 探测层属性名的 helper，注入到两个子进程脚本。复用 lib.model_probe 的别名表。
 _DETECT_HELPER = r'''
 from lib.model_probe import (
     _ATTN_ALIASES, _MLP_ALIASES, _ROUTER_ALIASES, _detect_attr, _detect_router,
 )
 
 def _detect_layer_attrs(model, layer_prefix="model.layers"):
-    """探测真实层的 attn/mlp/router 属性名。返回 (attn_attr, mlp_attr, router_relpath)。
-    router_relpath 相对 layer，如 'mlp.gate'；找不到返回 None。
-    attn/mlp 用第一层即可；router 要找第一个含 MoE 结构的层（前若干层可能是 dense，
-    没有 gate/experts）。"""
+    """探测真实层的 attn/mlp/router 属性名。返回 (attn_attr, mlp_attr, router_relpath)。"""
     parts = layer_prefix.split(".")
     obj = model
     for p in parts:
@@ -134,21 +152,20 @@ def _detect_layer_attrs(model, layer_prefix="model.layers"):
     return attn, mlp, router
 '''
 
-# HF 侧：直接在主进程内挂 hook，跑 forward，落盘
+# HF 侧：主进程内挂 hook，跑 forward（prefill + decode1），落盘
 _HF_SCRIPT = _DETECT_HELPER + r'''
-import os, sys, json, torch
+import os, sys, torch
 sys.path.insert(0, %r)
-from lib import load_model_profile, HookManager, HookPoint, CaptureSpec, config_patch
+from lib import load_model_profile, config_patch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 model_path = %r
 prompt = %r
-max_tokens = %r
 out_pt = %r
 layers_arg = %r   # None 或 list[int]
 only_arg = %r     # None 或 "attn"/"mlp"/"router"
 layer_prefix = %r
-probe_attrs = %r  # None 或 dict(layer_prefix/attn/mlp/router)，来自 probe_model.py
+probe_attrs = %r  # None 或 dict，来自 probe_model.py
 
 prof = load_model_profile(model_path)
 cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
@@ -161,59 +178,127 @@ model = AutoModelForCausalLM.from_pretrained(
     attn_implementation="eager", device_map="auto",
 ).eval()
 tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
+hf = model.model  # BailingMoeModel 等骨干
 
-# 属性名：优先用 probe_attrs（probe_model.py 落盘的探测结果），否则运行时反射探测
+# 属性名：优先 probe_attrs，否则反射探测
 if probe_attrs and probe_attrs.get("attn"):
     attn_attr = probe_attrs["attn"]; mlp_attr = probe_attrs["mlp"]; router_rel = probe_attrs["router"]
     print(f"[HF] 用 probe 结果: attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
 else:
     attn_attr, mlp_attr, router_rel = _detect_layer_attrs(model, layer_prefix)
     print(f"[HF] 运行时探测: attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
-if only_arg == "attn" and not attn_attr:
-    print("[HF] 警告：未探测到 attn 属性，无法挂 attn hook", flush=True)
-if only_arg == "mlp" and not mlp_attr:
-    print("[HF] 警告：未探测到 mlp 属性，无法挂 mlp hook", flush=True)
 
-# 建 hook 点
 layers = layers_arg if layers_arg is not None else list(range(prof.num_layers))
-pts = []
-for i in layers:
-    base = f"{layer_prefix}.{i}"
-    if only_arg in (None, "attn") and attn_attr:
-        pts.append(HookPoint(f"layer{i}_attn_out", f"{base}.{attn_attr}", kind="post"))
-    if only_arg in (None, "mlp") and mlp_attr:
-        pts.append(HookPoint(f"layer{i}_mlp_out", f"{base}.{mlp_attr}", kind="post"))
-    if only_arg == "router" and prof.is_moe and router_rel:
-        rp = f"{base}.{router_rel}"
-        # gate.forward 返回 tuple，如 BailingMoeV2 (topk_idx, topk_weight, logits)。
-        # pre-hook 抓的是 gate 输入(hidden_states)不是 logits，post-hook 抓的是
-        # 整个 tuple——都不能直接拿 logits。改用 patch + output_index 取 tuple 里
-        # 的 logits（通常在最后，index=-1）。topk_idx/weight 的 index 因模型而异，
-        # 这里只可靠对比 router_logits；topk 对比需按模型适配 output_index。
-        pts.append(HookPoint(f"layer{i}_router_logits", rp, kind="patch", output_index=-1))
-print(f"[HF] hook 点数: {len(pts)}", flush=True)
+cap = {}
+phase = {"v": "prefill"}
 
-hm = HookManager()
-spec = CaptureSpec(hook_points=pts, owner=model, clone=True)
+# ---- 默认口径：layer INPUT hidden_states（pre-hook + 立即 clone）----
+# 用 pre-hook 是因为 layer body 做 residual=hidden_states 后有 in-place，post-hook
+# 抓到的 args[0] 已被污染。pre-hook 在 body 执行前抓，立即 clone 锁定原始值。
+hooks = []
+if only_arg is None:
+    for li in layers:
+        layer = hf.layers[li]
+        def make_pre(idx):
+            def ph(module, args, kwargs):
+                key = f"{phase['v']}:layer{idx}_in"
+                if key not in cap:
+                    hs = args[0] if len(args) > 0 else kwargs.get("hidden_states")
+                    cap[key] = hs.detach().to(torch.float32).cpu().clone()
+            return ph
+        hooks.append(layer.register_forward_pre_hook(make_pre(li), with_kwargs=True))
+
+    # embedding 输出（HF word_embeddings 是普通 nn.Embedding，post-hook 可靠）
+    def emb_hook(module, args, kwargs, output):
+        key = f"{phase['v']}:embedding"
+        if key not in cap:
+            cap[key] = output.detach().to(torch.float32).cpu()
+    hooks.append(hf.word_embeddings.register_forward_hook(emb_hook, with_kwargs=True))
+
+    # final norm 输出 + logits
+    def norm_hook(module, args, kwargs, output):
+        key = f"{phase['v']}:final_norm"
+        if key not in cap:
+            out = output[0] if isinstance(output, tuple) else output
+            cap[key] = out.detach().to(torch.float32).cpu()
+    hooks.append(hf.norm.register_forward_hook(norm_hook, with_kwargs=True))
+    def logits_hook(module, args, kwargs, output):
+        key = f"{phase['v']}:logits"
+        if key not in cap:
+            cap[key] = output.detach().to(torch.float32).cpu()
+    hooks.append(model.lm_head.register_forward_hook(logits_hook, with_kwargs=True))
+else:
+    # ---- 子算子细化（drill-down）：attn_out / mlp_out / router_logits ----
+    for li in layers:
+        base = hf.layers[li]
+        if only_arg == "attn" and attn_attr:
+            mod = getattr(base, attn_attr)
+            def make_post(idx, name):
+                def ph(module, args, kwargs, output):
+                    key = f"{phase['v']}:layer{idx}_{name}"
+                    if key not in cap:
+                        cap[key] = output.detach().to(torch.float32).cpu()
+                return ph
+            hooks.append(mod.register_forward_hook(make_post(li, "attn_out"), with_kwargs=True))
+        if only_arg == "mlp" and mlp_attr:
+            mod = getattr(base, mlp_attr)
+            def make_post2(idx, name):
+                def ph(module, args, kwargs, output):
+                    key = f"{phase['v']}:layer{idx}_{name}"
+                    if key not in cap:
+                        cap[key] = output.detach().to(torch.float32).cpu()
+                return ph
+            hooks.append(mod.register_forward_hook(make_post2(li, "mlp_out"), with_kwargs=True))
+        if only_arg == "router" and prof.is_moe and router_rel:
+            # gate.forward 返回 tuple (topk_idx, topk_weight, logits)；post-hook 抓
+            # 整个 tuple，取 output_index=-1 即 logits
+            mod = base
+            for p in router_rel.split("."):
+                mod = getattr(mod, p)
+            def make_router(idx):
+                orig = mod.forward
+                def patched(*a, **kw):
+                    out = orig(*a, **kw)
+                    key = f"{phase['v']}:layer{idx}_router_logits"
+                    if key not in cap:
+                        t = out[-1] if isinstance(out, tuple) else out
+                        cap[key] = t.detach().to(torch.float32).cpu()
+                    return out
+                return patched
+            mod.forward = make_router(li)
+print(f"[HF] hook 点数: {len(hooks)}", flush=True)
+
+# ---- prefill forward ----
 first_dev = next(model.parameters()).device
 ids = tok(prompt, return_tensors="pt").input_ids.to(first_dev)
-with torch.no_grad(), hm.capture(model, spec):
-    out = model.generate(ids, max_new_tokens=max_tokens, do_sample=False)
-inter = hm.get_intermediates()
-# 只存首 token 位置的中间值（generate 多步时 hook 被多次调用，最后一次是最后一步；
-# 为对齐，统一取每个 hook 点最后一次抓到的 tensor——对 max_tokens=1 即首 token）
-torch.save({k: v.cpu() for k, v in inter.items()}, out_pt)
-print(f"[HF] 已抓 {len(inter)} 个中间值 -> {out_pt}", flush=True)
-print(f"[HF] gen_ids: {out[0][ids.shape[1]:].tolist()}", flush=True)
+seq_len = ids.shape[1]
+pos_ids = torch.arange(0, seq_len, dtype=torch.long).unsqueeze(0).to(first_dev)
+print(f"[HF] prefill ({seq_len} tokens)...", flush=True)
+with torch.no_grad():
+    out_pre = model(input_ids=ids, position_ids=pos_ids, use_cache=True)
+print(f"[HF] prefill 抓到 {sum(1 for k in cap if k.startswith('prefill'))} 个", flush=True)
+
+# ---- decode step 1 ----
+phase["v"] = "decode1"
+next_tok = out_pre.logits[0, -1, :].argmax(dim=-1, keepdim=True).unsqueeze(0)
+next_pos = torch.tensor([[seq_len]], dtype=torch.long, device=first_dev)
+print(f"[HF] decode1 (next_tok={next_tok.item()})...", flush=True)
+with torch.no_grad():
+    _ = model(input_ids=next_tok, position_ids=next_pos,
+              use_cache=True, past_key_values=out_pre.past_key_values)
+print(f"[HF] decode1 抓到 {sum(1 for k in cap if k.startswith('decode1'))} 个", flush=True)
+
+for h in hooks:
+    try: h.remove()
+    except Exception: pass
+
+torch.save(cap, out_pt)
+print(f"[HF] -> {out_pt}", flush=True)
 '''
 
-# vLLM 侧：TP>1 时 worker 在 spawn 子进程，主进程拿不到 model 对象，
-# 用 collective_rpc 把 hook 函数 RPC 进 worker 子进程注册。捕获结果存
-# model._cap（model 在子进程单一持久；不能存模块级 dict——collective_rpc
-# 每次 cloudpickle 序列化新副本，会读不到）。详见 docs/ 里 collective_rpc 陷阱。
+# vLLM 侧：collective_rpc 注入 hook，generate 触发，取回落盘
 _VLLM_SCRIPT = _DETECT_HELPER + r'''
 import os, sys, torch
-# collective_rpc 用 cloudpickle 传函数进 worker 子进程，必须开此项
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 sys.path.insert(0, %r)
 from lib import load_model_profile
@@ -234,118 +319,155 @@ print(f"[vLLM] layers={prof.num_layers} moe={prof.is_moe}", flush=True)
 
 # ============================================================================
 # 模块级 RPC 函数（collective_rpc 要求 top-level，pickle 序列化）
-# hook 描述 hook_specs = list[(name, module_path, kind, output_index)]
-# kind: "post"=register_forward_hook 抓输出；"patch"=monkey-patch forward
-#       抓返回 tuple 的某一项（router gate 返回 (topk_idx,topk_weight,logits)）
 # 捕获统一存 worker.model_runner.model._cap（持久对象，规避 cloudpickle 副本陷阱）
+# 阶段切换：用 call counter，prefill 采样层都触发过一次后翻到 decode1
 # ============================================================================
 
-def _resolve(model, path):
-    """点路径取子模块，支持数字索引（layers.1）"""
-    obj = model
-    for part in path.split("."):
-        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
-    return obj
-
-def _attach_hooks(worker, hook_specs):
-    """在 worker 子进程挂 hook。hook_specs: list[(name, path, kind, output_index)]"""
+def _attach_stage_hooks(worker, layer_indices, only_arg, attn_attr, mlp_attr, router_rel, is_moe):
+    """挂 stage hook。only_arg=None 比 layer input 残差 + emb + final_norm + logits；
+    否则比指定子算子（attn_out/mlp_out/router_logits）。"""
     import torch
     model = worker.model_runner.model
-    # 先摘旧 hook（幂等）
-    for h in getattr(model, "_cmp_hooks", []) or []:
+    for h in getattr(model, "_st_hooks", []) or []:
         try: h.remove()
         except Exception: pass
-    for mod, orig in getattr(model, "_cmp_patches", []) or []:
+    for mod, orig in getattr(model, "_st_patches", []) or []:
         try: mod.forward = orig
         except Exception: pass
-    model._cmp_hooks = []
-    model._cmp_patches = []
+    model._st_hooks = []
+    model._st_patches = []
     model._cap = {}
-    fired = {"n": 0}
+    model._st_phase = "prefill"
+    model._st_prefill_fired = 0
+    inner = model.model
 
-    def make_post(name, output_index):
-        def hook(_m, _a, output):
-            # 只留第一次触发（prefill）；后续 decode 步是单 token，不覆盖
-            if name in model._cap:
-                return
-            try:
-                t = output[output_index] if isinstance(output, tuple) else output
-                if torch.is_tensor(t):
-                    model._cap[name] = t.detach().to(torch.float32).cpu()
-                    fired["n"] += 1
-            except Exception as e:
-                model._cap.setdefault("_err_" + name, repr(e))
-        return hook
-
-    def make_patch(name, module, output_index):
-        orig = module.forward
-        def patched(*a, **kw):
-            out = orig(*a, **kw)
-            if name not in model._cap:
-                try:
-                    t = out[output_index] if isinstance(out, tuple) else out
-                    if torch.is_tensor(t):
-                        model._cap[name] = t.detach().to(torch.float32).cpu()
-                        fired["n"] += 1
-                except Exception as e:
-                    model._cap.setdefault("_err_" + name, repr(e))
+    if only_arg is None:
+        # ---- embedding：monkey-patch embed_input_ids（CustomOp 的 register_forward_hook 不可靠）----
+        orig_embed = inner.embed_input_ids
+        def patched_embed(input_ids):
+            out = orig_embed(input_ids)
+            key = f"{model._st_phase}:embedding"
+            if key not in model._cap:
+                model._cap[key] = out.detach().to(torch.float32).cpu().clone()
             return out
-        module.forward = patched
-        model._cmp_patches.append((module, orig))
+        inner.embed_input_ids = patched_embed
+        model._st_orig_embed = orig_embed
+        model._st_patches.append(("__embed__", None))  # 标记需还原
 
-    attached = 0
-    for name, path, kind, output_index in hook_specs:
-        try:
-            mod = _resolve(model, path)
-            if kind == "patch":
-                make_patch(name, mod, output_index)
-            else:
-                h = mod.register_forward_hook(make_post(name, output_index))
-                model._cmp_hooks.append(h)
-            attached += 1
-        except Exception as e:
-            model._cap.setdefault("_err_" + name, f"attach: {e!r}")
-    model._cap["_fired"] = 0  # 占位，fetched 时读 fired["n"]
-    model._fired_ref = fired
-    return {"attached": attached, "total": len(hook_specs)}
+        # ---- per-layer INPUT hidden_states：pre-hook + 立即 clone ----
+        for li in layer_indices:
+            layer = inner.layers[li]
+            def make_pre(idx):
+                def ph(module, args, kwargs):
+                    phase = model._st_phase
+                    key = f"{phase}:layer{idx}_in"
+                    if key not in model._cap:
+                        hs = args[0] if len(args) > 0 else kwargs.get("hidden_states")
+                        model._cap[key] = hs.detach().to(torch.float32).cpu().clone()
+                        if phase == "prefill":
+                            model._st_prefill_fired += 1
+                            if model._st_prefill_fired >= len(layer_indices):
+                                model._st_phase = "decode1"
+                return ph
+            model._st_hooks.append(layer.register_forward_pre_hook(make_pre(li), with_kwargs=True))
 
-def _fetch_capture(worker):
+        # ---- final norm 输出 ----
+        def norm_hook(module, args, kwargs, output):
+            phase = model._st_phase
+            key = f"{phase}:final_norm"
+            if key not in model._cap:
+                out = output[0] if isinstance(output, tuple) else output
+                model._cap[key] = out.detach().to(torch.float32).cpu().clone()
+        model._st_hooks.append(inner.norm.register_forward_hook(norm_hook, with_kwargs=True))
+
+        # ---- logits ----
+        def logits_hook(module, args, kwargs, output):
+            phase = model._st_phase
+            key = f"{phase}:logits"
+            if key not in model._cap:
+                model._cap[key] = output.detach().to(torch.float32).cpu().clone()
+        model._st_hooks.append(model.lm_head.register_forward_hook(logits_hook, with_kwargs=True))
+    else:
+        # ---- 子算子细化 ----
+        for li in layer_indices:
+            base = inner.layers[li]
+            if only_arg == "attn" and attn_attr:
+                mod = getattr(base, attn_attr)
+                def make_post(idx):
+                    def ph(module, args, kwargs, output):
+                        phase = model._st_phase
+                        key = f"{phase}:layer{idx}_attn_out"
+                        if key not in model._cap:
+                            model._cap[key] = output.detach().to(torch.float32).cpu()
+                    return ph
+                model._st_hooks.append(mod.register_forward_hook(make_post(li), with_kwargs=True))
+            if only_arg == "mlp" and mlp_attr:
+                mod = getattr(base, mlp_attr)
+                def make_post2(idx):
+                    def ph(module, args, kwargs, output):
+                        phase = model._st_phase
+                        key = f"{phase}:layer{idx}_mlp_out"
+                        if key not in model._cap:
+                            model._cap[key] = output.detach().to(torch.float32).cpu()
+                    return ph
+                model._st_hooks.append(mod.register_forward_hook(make_post2(li), with_kwargs=True))
+            if only_arg == "router" and is_moe and router_rel:
+                mod = base
+                for p in router_rel.split("."):
+                    mod = getattr(mod, p)
+                def make_router(idx):
+                    orig = mod.forward
+                    def patched(*a, **kw):
+                        out = orig(*a, **kw)
+                        phase = model._st_phase
+                        key = f"{phase}:layer{idx}_router_logits"
+                        if key not in model._cap:
+                            t = out[-1] if isinstance(out, tuple) else out
+                            model._cap[key] = t.detach().to(torch.float32).cpu()
+                        return out
+                    return patched
+                mod.forward = make_router(li)
+                model._st_patches.append((mod, mod.forward))
+        # 子算子模式：用第一个采样层首次触发后翻阶段
+        def phase_flip(module, args, kwargs):
+            if model._st_phase == "prefill":
+                model._st_phase = "decode1"
+        model._st_hooks.append(inner.layers[layer_indices[0]].register_forward_pre_hook(phase_flip, with_kwargs=True))
+    return {"attached": len(model._st_hooks), "layers": layer_indices, "only": only_arg}
+
+def _fetch_cap(worker):
     model = worker.model_runner.model
-    cap = getattr(model, "_cap", None) or {}
-    fired = getattr(model, "_fired_ref", None)
-    out = {k: v for k, v in cap.items() if not k.startswith("_")}
-    out["_fired"] = fired["n"] if fired else cap.get("_fired", 0)
-    out["_errors"] = {k: v for k, v in cap.items() if k.startswith("_err_")}
-    return out
+    return dict(getattr(model, "_cap", {}) or {})
 
-def _detach_hooks(worker):
+def _detach_stage_hooks(worker):
     model = worker.model_runner.model
-    for h in getattr(model, "_cmp_hooks", []) or []:
+    for h in getattr(model, "_st_hooks", []) or []:
         try: h.remove()
         except Exception: pass
-    for mod, orig in getattr(model, "_cmp_patches", []) or []:
+    # 还原 embed_input_ids monkey-patch
+    if hasattr(model, "_st_orig_embed"):
+        try: model.model.embed_input_ids = model._st_orig_embed
+        except Exception: pass
+    for mod, orig in getattr(model, "_st_patches", []) or []:
+        if mod == "__embed__": continue
         try: mod.forward = orig
         except Exception: pass
-    model._cmp_hooks = []
-    model._cmp_patches = []
+    model._st_hooks = []
+    model._st_patches = []
     return {"detached": True}
 
-# ============================================================================
-# 先用一个轻量 RPC 探测 worker 内模型的真实属性名（attn/mlp/router）
-# probe_attrs 若已给则跳过
-# ============================================================================
 def _probe_layer_attrs(worker, layer_prefix):
     model = worker.model_runner.model
     return _detect_layer_attrs(model, layer_prefix)
 
 llm = LLM(
     model=model_path, tensor_parallel_size=tp, dtype="bfloat16",
-    trust_remote_code=True, enforce_eager=True,   # 禁 compile，hook 才挂得上
+    trust_remote_code=True, enforce_eager=True,
     max_model_len=2048, gpu_memory_utilization=0.9,
 )
 print(f"[vLLM] engine started (tp={tp})", flush=True)
 
-# 属性名：优先 probe_attrs，否则 RPC 进 worker 反射探测
+# 属性名：优先 probe_attrs，否则 RPC 进 worker 探测
 if probe_attrs and probe_attrs.get("attn"):
     attn_attr = probe_attrs["attn"]; mlp_attr = probe_attrs["mlp"]; router_rel = probe_attrs["router"]
     print(f"[vLLM] 用 probe 结果: attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
@@ -353,23 +475,9 @@ else:
     attn_attr, mlp_attr, router_rel = llm.collective_rpc(_probe_layer_attrs, args=(layer_prefix,))[0]
     print(f"[vLLM] worker 内探测: attn={attn_attr} mlp={mlp_attr} router={router_rel}", flush=True)
 
-# 生成 hook 描述（与 HF 侧点路径一致）
 layers = layers_arg if layers_arg is not None else list(range(prof.num_layers))
-specs = []  # (name, path, kind, output_index)
-for i in layers:
-    base = f"{layer_prefix}.{i}"
-    if only_arg in (None, "attn") and attn_attr:
-        specs.append((f"layer{i}_attn_out", f"{base}.{attn_attr}", "post", 0))
-    if only_arg in (None, "mlp") and mlp_attr:
-        specs.append((f"layer{i}_mlp_out", f"{base}.{mlp_attr}", "post", 0))
-    if only_arg == "router" and prof.is_moe and router_rel:
-        # gate.forward 返回 tuple (topk_idx, topk_weight, logits)；post-hook 抓
-        # 整个 tuple 错、pre-hook 抓输入错。用 patch 取 output_index=-1 即 logits。
-        specs.append((f"layer{i}_router_logits", f"{base}.{router_rel}", "patch", -1))
-print(f"[vLLM] hook 点数: {len(specs)}", flush=True)
-
-# 注入 hook → generate 触发 → 取回 → 摘 hook
-res = llm.collective_rpc(_attach_hooks, args=(specs,))
+res = llm.collective_rpc(_attach_stage_hooks,
+                         args=(layers, only_arg, attn_attr, mlp_attr, router_rel, prof.is_moe))
 print(f"[vLLM] attach: {res[0]}", flush=True)
 
 sp = SamplingParams(temperature=0.0, max_tokens=max_tokens)
@@ -377,17 +485,14 @@ outs = llm.generate([prompt], sp)
 gen_ids = list(outs[0].outputs[0].token_ids)
 print(f"[vLLM] gen_ids: {gen_ids}", flush=True)
 
-cap = llm.collective_rpc(_fetch_capture)[0]
-print(f"[vLLM] hook fired: {cap.get('_fired')}", flush=True)
-if cap.get("_errors"):
-    print(f"[vLLM] hook errors: {cap['_errors']}", flush=True)
-llm.collective_rpc(_detach_hooks)
+cap = llm.collective_rpc(_fetch_cap)[0]
+print(f"[vLLM] 抓到 {len(cap)} 个 stage 值", flush=True)
+for k in sorted(cap):
+    v = cap[k]
+    print(f"  {k}: {tuple(v.shape) if torch.is_tensor(v) else type(v).__name__}", flush=True)
+llm.collective_rpc(_detach_stage_hooks)
 
-# 取回捕获（已是 CPU fp32），剔除元数据键
-inter = {k: v for k, v in cap.items() if not k.startswith("_") and torch.is_tensor(v)}
-print(f"[vLLM] 已抓 {len(inter)} 个中间值", flush=True)
-for k, v in sorted(inter.items()):
-    print(f"  {k}: {tuple(v.shape)}", flush=True)
+inter = {k: v for k, v in cap.items() if torch.is_tensor(v)}
 torch.save(inter, out_pt)
 print(f"[vLLM] -> {out_pt}", flush=True)
 '''
@@ -441,13 +546,23 @@ def main():
             "mlp": pd["mlp_attr"]["value"],
             "router": pd["router_attr"]["value"],
         }
-        # probe 的 layer_prefix 优先于 --layer-prefix
         if probe_attrs["layer_prefix"]:
             args.layer_prefix = probe_attrs["layer_prefix"]
         print(f"[probe] 读取探测结果 {pj}")
         print(f"[probe] layer_prefix={probe_attrs['layer_prefix']} "
               f"attn={probe_attrs['attn']} mlp={probe_attrs['mlp']} "
               f"router={probe_attrs['router']}")
+
+    # 默认采样层（仅在未指定 --layers 时用，需总层数；从 probe 或 config 推断）
+    if layers_arg is None:
+        try:
+            from lib import load_model_profile
+            nl = load_model_profile(args.model).num_layers
+            layers_arg = sample_layers(nl)
+            print(f"[layers] 自动采样 {nl} 层 → {layers_arg}")
+        except Exception as e:
+            print(f"[layers] 无法推断总层数({e})，请用 --layers 显式指定", file=sys.stderr)
+            sys.exit(2)
 
     tmpdir = tempfile.mkdtemp(prefix="compare_layers_")
     hf_pt = os.path.join(tmpdir, "hf_inter.pt")
@@ -457,7 +572,7 @@ def main():
         print("\n" + "=" * 60)
         print("[HF] 抓逐层中间值...")
         print("=" * 60)
-        script = _HF_SCRIPT % (_ROOT, args.model, args.prompt, args.max_tokens,
+        script = _HF_SCRIPT % (_ROOT, args.model, args.prompt,
                                hf_pt, layers_arg, args.only, args.layer_prefix, probe_attrs)
         run_subprocess(script, tag="HF")
 
@@ -477,79 +592,67 @@ def main():
 
     # 对比
     print("\n" + "=" * 60)
-    print("[compare] 逐层 / 逐算子中间值对比")
+    print("[compare] 逐层中间值对比（cos decay）")
     print("=" * 60)
     import torch
     from lib import compare_tensors
     hf = torch.load(hf_pt)
     vllm = torch.load(vllm_pt)
 
-    names = sorted(set(hf) & set(vllm), key=_sort_key)
-    if not names:
-        print("[compare] 两边无共同 hook 点。HF 侧:", list(hf)[:5],
-              "vLLM 侧:", list(vllm)[:5])
-        sys.exit(1)
+    # stage 顺序：embedding → 各层 layer_in → final_norm → logits（仅默认口径）
+    # 子算子口径：各层 attn_out/mlp_out/router_logits
+    if args.only is None:
+        stage_order = ["embedding"] + [f"layer{i}_in" for i in layers_arg] + ["final_norm", "logits"]
+    else:
+        suffix = {"attn": "attn_out", "mlp": "mlp_out", "router": "router_logits"}[args.only]
+        stage_order = [f"layer{i}_{suffix}" for i in layers_arg]
 
     first_diverge = None
-    skipped = []
-    print(f"{'stage':<28} {'cos':>10} {'max_abs':>12} {'mean_abs':>12} {'verdict'}")
-    print("-" * 80)
-    for name in names:
-        a, b = hf[name], vllm[name]
-        try:
+    for phase in (["prefill", "decode1"] if args.max_tokens >= 1 else ["prefill"]):
+        print(f"\n----- phase: {phase} -----")
+        print(f"{'stage':<24} {'cos':>10} {'max_abs':>12} {'mean_abs':>12} {'verdict'}")
+        print("-" * 76)
+        for st in stage_order:
+            key = f"{phase}:{st}"
+            a = hf.get(key); b = vllm.get(key)
+            if a is None or b is None:
+                print(f"{st:<24} {'MISSING':>10}  hf={'no' if a is None else 'ok'} vllm={'no' if b is None else 'ok'}")
+                continue
             a, b = _align(a, b)
             if a.shape != b.shape:
-                # 形状对不齐（如 router topk 因 TP 切分不同），跳过
-                print(f"{name:<28} {'shape_skip':>10} {tuple(a.shape)} vs {tuple(b.shape)}")
-                skipped.append(name)
+                print(f"{st:<24} {'shape_skip':>10} {tuple(a.shape)} vs {tuple(b.shape)}")
                 continue
-            r = compare_tensors(name, a, b, atol=args.atol)
-            ok = r.is_close or r.cos >= args.cos_thresh
-            mark = "✅" if ok else "❌"
-            print(f"{name:<28} {r.cos:>10.6f} {r.max_abs_diff:>12.4e} "
-                  f"{r.mean_abs_diff:>12.4e} {mark}")
-            if not ok and first_diverge is None:
-                first_diverge = name
-        except Exception as e:
-            print(f"{name:<28} ERR {e}")
-            skipped.append(name)
+            try:
+                r = compare_tensors(st, a, b, atol=args.atol)
+                ok = r.is_close or r.cos >= args.cos_thresh
+                mark = "✅" if ok else "❌"
+                print(f"{st:<24} {r.cos:>10.6f} {r.max_abs_diff:>12.4e} "
+                      f"{r.mean_abs_diff:>12.4e} {mark}")
+                if not ok and first_diverge is None:
+                    first_diverge = f"{phase}:{st}"
+            except Exception as e:
+                print(f"{st:<24} ERR {e}")
 
-    print("-" * 80)
+    print("-" * 76)
     if first_diverge:
         print(f"\n[verdict] ❌ 首个发散点: {first_diverge}")
-        print("  → 该层/算子之前的层都一致，从这里开始 HF 与 vLLM 分叉。")
-        print("  → 用 op-locate skill 在此层内继续细化（sub-op 级 hook）。")
-    elif skipped:
-        print(f"\n[verdict] ⚠️  已对比的层/算子均一致，但 {len(skipped)} 个因形状未对齐被跳过：{skipped}")
+        print("  → 该 stage 之前都一致，从这里开始 HF 与 vLLM 分叉。")
+        print("  → 若是 layerN_in：误差在 L{N-1} 的 attention 或 MoE 累积产生。")
+        print("  → 用 --only attn/mlp/router --layers N 在该层内 sub-op 细化。")
     else:
-        print("\n[verdict] ✅ 所有对比的层/算子均一致")
+        print("\n[verdict] ✅ 所有对比的 stage 均一致")
     print(f"\n[info] 中间值落盘目录: {tmpdir}")
 
 
 def _align(a, b):
     """对齐 HF 与 vLLM 中间张量的 batch 维差异。
-    HF 输出常为 [1, seq, H]（带 batch 维），vLLM 为 [seq, H]（无 batch 维，PLAN
-    layer_compare §3 提到）。squeeze 掉大小为 1 的前导维使两者可比。"""
+    HF 常为 [1, seq, H]，vLLM 为 [seq, H]（无 batch 维）。squeeze 掉大小为 1 的前导维。"""
     import torch
     while a.dim() > b.dim() and a.shape[0] == 1:
         a = a.squeeze(0)
     while b.dim() > a.dim() and b.shape[0] == 1:
         b = b.squeeze(0)
     return a, b
-
-
-def _sort_key(name: str):
-    """layer0_attn_out < layer0_mlp_out < layer1_..."""
-    import re
-    m = re.search(r"layer(\d+)", name)
-    layer = int(m.group(1)) if m else 999
-    op_order = {"attn_out": 0, "router_logits": 1, "topk": 2, "mlp_out": 3}
-    op = 99
-    for k, v in op_order.items():
-        if k in name:
-            op = v
-            break
-    return (layer, op)
 
 
 if __name__ == "__main__":

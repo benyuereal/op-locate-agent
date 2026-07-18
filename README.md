@@ -21,16 +21,20 @@ HIP_VISIBLE_DEVICES=<空闲卡> python3 examples/quickstart_antangelmed.py \
 `--model` **必填**。同时跑 HF(基准)+vLLM，对比输出 token：✅ 一致率≥90% 且无 NULL / ❌ vLLM 全 NULL / ⚠️ 部分不一致。
 `--env` 显式设 `VLLM_ENABLE_MOE_FUSED_GATE=0` 做对照（**默认不设**——排查工具不预设结论）。
 
-### 2. 逐层 / 逐算子对比（定位到发散的层/算子）
+### 2. 逐层中间值对比（定位到发散的层）
 
-输出不一致时，比每一层的中间张量，打印首个发散点：
+输出不一致时，比每层入口的 hidden_states（层间残差真值），看误差从哪层开始、如何累积：
 
 ```bash
 HIP_VISIBLE_DEVICES=<空闲卡> python3 examples/compare_layers.py \
-    --model <模型路径> --layers 0,1,2,3 --probe-dir /tmp/probe_xxx
+    --model <模型路径> --probe-dir /tmp/probe_xxx
 ```
 
-`--probe-dir` 读探测结果（见第 3 步），跳过运行时探测；`--layers` 只比指定层（省显存）；`--only router` 只比 MoE 选专家；`--env` 对照验证。
+默认全模型采样层（32 层 → [0,1,2,8,16,24,28,30,31]，浅+中+深），打印逐层 cos 衰减表 + 首发散点。定位到发散层后，用 `--only attn/mlp/router --layers N` 在该层内做算子级细化。
+
+`--probe-dir` 读探测结果（见第 3 步）；`--layers` 指定层；`--env` 设 `VLLM_ENABLE_MOE_FUSED_GATE=0` 对照（fused_gate 历史已排除，仅备）。
+
+> 口径：比 **layer input**（`register_forward_pre_hook` + 立即 clone），不是 attn/mlp 输出——layer body 的 in-place 残差操作会污染 post-hook 抓取值，曾致误判。embedding 用 monkey-patch（CustomOp 的 register_forward_hook 不可靠）。源自历史验证过的 `test_stage_compare.py`。
 
 ### 3. 探测模型结构（先跑这个，落盘供第 2 步用）
 
