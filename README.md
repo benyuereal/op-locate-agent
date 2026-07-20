@@ -3,112 +3,112 @@
 > 把"vLLM 输出和 transformers 对不齐，定位到具体算子"——从天级压到小时级。
 > 适用任意 HF/ModelScope 模型（MoE / dense）在 vLLM 上的精度异常定位。
 
-## 前提
+## 快速开始
+
+### 1. 拉项目 → 启动 Claude
+
+```bash
+git clone https://github.com/benyuereal/op-locate-agent.git
+cd op-locate-agent
+
+# 启动 Claude Code（带 op-locate skill）
+claude -p "用 op-locate skill 定位 /path/to/model 的 vLLM 精度问题" \
+  --allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebFetch,Skill"
+```
+
+### 2. 前提
 
 - vLLM + transformers + torch 已装
 - 模型已下载到本地，目录含 `config.json`
-- **卡用 `HIP_VISIBLE_DEVICES` 前置指定**，脚本不自动选（避免误占在线服务）
+- **空闲卡用 `HIP_VISIBLE_DEVICES` 前置指定**（`rocm-smi` 确认）
 
-## 四步定位
+### 3. 定位流程
 
-### 1. 探测模型结构
-
-从模型真实结构反射 + 源码交叉验证，不武断推断属性名：
-
-```bash
-python3 examples/probe_model.py --model <模型路径> --workdir /tmp/probe_xxx
+```
+① 逐层对比 → 找到发散层（只需一条命令，模型结构自动探测）
+② 算子细化 → 定位到具体算子（在发散层内钻取）
+③ 出报告   → 结论 + vLLM 源码调用链
 ```
 
-### 2. 逐层定位发散层
+**① 逐层对比**：比每层输入 hidden_states，看误差从哪层开始、如何累积。
 
-比每层输入 hidden_states（层间残差真值），看误差从哪层开始：
+```bash
+HIP_VISIBLE_DEVICES=<空闲卡> python3 examples/compare_layers.py --model <模型路径>
+```
+
+> 自动探测模型结构（attn/mlp/router 属性名），自动采样全模型层，打印逐层 cos 衰减表 + 输出 token 对比。
+
+**② 算子细化**：定位到发散层后，在该层内钻到具体算子。
 
 ```bash
 HIP_VISIBLE_DEVICES=<空闲卡> python3 examples/compare_layers.py \
-    --model <模型路径> --probe-dir /tmp/probe_xxx
+    --model <模型路径> --op <算子名> --layers <发散层号>
 ```
 
-默认全模型采样（32 层 → [0,1,2,8,16,24,28,30,31]），打印逐层 cos 衰减表 + 首发散点。
+> `--op` 支持任意属性名（如 `attn`/`mlp`/`router`/`rmsnorm`），不限于三件套。
+> MoE 推荐排除顺序：`router` → `mlp` → `attn`。
+> `--env` 对照验证（如 `VLLM_ENABLE_MOE_FUSED_GATE=0`，默认不设）。
 
-### 3. 算子级细化
-
-定位到发散层后，在该层内做子算子 drill-down：
-
-```bash
-# MoE 模型：逐算子对比（router → attn → mlp）
-HIP_VISIBLE_DEVICES=<空闲卡> python3 examples/compare_layers.py \
-    --model <模型路径> --probe-dir /tmp/probe_xxx \
-    --op router --layers <发散层号>
-HIP_VISIBLE_DEVICES=<空闲卡> python3 examples/compare_layers.py \
-    --model <模型路径> --probe-dir /tmp/probe_xxx \
-    --op mlp --layers <发散层号>
-
-# Dense 模型：逐算子对比（attn → mlp → rmsnorm 等）
-HIP_VISIBLE_DEVICES=<空闲卡> python3 examples/compare_layers.py \
-    --model <模型路径> --probe-dir /tmp/probe_xxx \
-    --op <算子属性名> --layers <发散层号>
-```
-
-`--op` 支持任意属性名（如 `rmsnorm`/`input_layernorm`/`self_attn`），不限于 `attn/mlp/router`。
-`--env` 设模型专属环境变量做对照（如 `VLLM_ENABLE_MOE_FUSED_GATE=0`，**默认不设**——排查工具不预设结论）。
-
-### 4. 出报告
-
-定位结论 + vLLM 源码调用链落盘成可人核的报告：
+**③ 出报告**：定位结论 + vLLM 源码调用链落盘。
 
 ```bash
 python3 examples/generate_report.py \
     --model <模型路径> \
     --compare-dir /tmp/compare_layers_xxx \   # 可多次传入聚合多轮细化
-    --probe-dir /tmp/probe_xxx \
     --symptom "vLLM 输出异常描述"
 ```
 
 产出 `reports/<model>_<date>/`：`report.md` + `verdict.json` + `evidence/`。
 
-> **工作流**：探测结构 → 逐层定位 → 算子细化 → 出报告。
-
-## 快速开始示例
+### 4. 完整示例（AntAngelMed）
 
 ```bash
-# 0. 卡空闲检查
-rocm-smi
-
-# 1. 探测结构（一次性）
-python3 examples/probe_model.py --model /path/to/model --workdir /tmp/probe_mymodel
-
-# 2. 逐层对比（定位发散层）
+# 确认空闲卡 → 逐层对比
 HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py \
-    --model /path/to/model --probe-dir /tmp/probe_mymodel
+    --model /models/AntAngelMed
 
-# 3. 算子 drill-down（在发散层细化）
+# 算子细化（L1 的 mlp 算子）
 HIP_VISIBLE_DEVICES=2,3,4,5 python3 examples/compare_layers.py \
-    --model /path/to/model --probe-dir /tmp/probe_mymodel \
-    --op mlp --layers <发散层号>
+    --model /models/AntAngelMed --op mlp --layers 1
 
-# 4. 出报告
+# 出报告
 python3 examples/generate_report.py \
-    --model /path/to/model \
+    --model /models/AntAngelMed \
     --compare-dir /tmp/compare_layers_xxx \
-    --probe-dir /tmp/probe_mymodel \
-    --symptom "vLLM 输出异常描述"
+    --symptom "vLLM 输出全 NULL"
 ```
 
-## 用 agent 自动定位
+## 目录结构
 
-```bash
-claude -p "用 op-locate skill 定位 <模型路径> 的 vLLM 精度问题" \
-  --allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebFetch,Skill"
+```
+op-locate-agent/
+├── examples/               # 入口脚本
+│   ├── compare_layers.py   # 逐层/逐算子对比（核心，自动探测模型结构）
+│   ├── generate_report.py  # 出报告
+│   └── probe_model.py      # 模型结构探测（compare_layers 已内置自动探测）
+├── lib/                    # 工具库
+│   ├── config_loader.py    # 模型配置解析
+│   ├── model_probe.py      # 模型结构反射探测
+│   ├── path_resolver.py    # vLLM 代码路径定位
+│   ├── hook_manager.py     # hook 注册与管理
+│   ├── tensor_compare.py   # 张量对比（cos/max_abs）
+│   └── platform_probe.py   # 平台信息探测
+├── knowledge/              # 知识库
+│   ├── precision_known_issues.md  # 已知精度问题库
+│   ├── vllm_forward_paths.md      # vLLM 前向路径速查
+│   └── arch_index.md             # 架构→代码路径映射
+├── skills/op-locate/       # Claude Code skill
+├── reports/                # 定位报告输出
+└── tests/                  # 单测
 ```
 
-不用 LLM 也能只用工具库：`from lib import load_model_profile, resolve_code_paths`。
+## 设计要点
 
-## 单独调试
-
-```bash
-HIP_VISIBLE_DEVICES=<空闲卡> TP=<n> ./run/run_vllm.sh <模型路径> "你好"
-HIP_VISIBLE_DEVICES=<空闲卡> ./run/run_hf.sh <模型路径> "你好"
-```
+- **自动探测**：`compare_layers.py` 运行时自动反射模型结构，无需先跑 `probe_model.py`。已有缓存（`--probe-dir`）则直接复用。
+- **运行时探针为准**：根因以 hook 抓取为准，不以静态分析为准。
+- **不预设结论**：默认不设修复环境变量，需对照时显式开 `--env`。
+- **泛化设计**：`--op` 支持任意属性名，dense/MoE 共用同一套探针体系。
+- **不自动回写知识库**：人工 review 是质量门。
 
 ## 测试
 
@@ -116,23 +116,3 @@ HIP_VISIBLE_DEVICES=<空闲卡> ./run/run_hf.sh <模型路径> "你好"
 python3 -m pytest tests/ -q          # 单测
 python3 lib/config_loader.py <模型路径>   # lib 自检
 ```
-
-## 目录
-
-```
-op-locate-agent/
-├── examples/      # 入口脚本：probe_model / compare_layers / generate_report
-├── lib/           # 工具库：config/hook/compare/probe/path
-├── knowledge/     # 知识库：arch→路径、已知坑、平台
-├── skills/op-locate/  # Claude Code skill
-├── run/           # 标准启动脚本
-├── reports/       # 定位报告输出
-└── tests/         # 单测
-```
-
-## 设计要点
-
-- **运行时探针为准**：根因以 hook 抓取为准，不以静态分析为准。
-- **不预设结论**：默认不设修复环境变量，需对照时显式开 `--env`。
-- **不自动回写知识库**：人工 review 是质量门。
-- **泛化设计**：`--op` 支持任意属性名，不限于 MoE 三件套；dense/MoE 共用同一套探针体系。
